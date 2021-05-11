@@ -1,0 +1,1129 @@
+---
+title: "Tz ESCC Microbiome"
+author: "Jason Nomburg"
+output: html_notebook
+---
+
+# Load libraries and source in functions
+```{r}
+library(tidyverse)
+library(pheatmap)
+library(reshape2)
+library(svglite)
+library(hash) # repacelment for hashmap...
+library(patchwork)
+library(magrittr)
+
+
+# Bray curtis
+library(vegan)
+
+# Plotting 
+library(scales) #allows use of "comma" to replace i.e. 1e6 with 1,000,000 during plotting
+
+
+# My functions
+source("functions.R")
+
+library(RColorBrewer) #for specifying pheatmap colorscheme
+
+library(ggplotify) # Convert pheatmaps to ggplot objects using as.ggplot
+
+select <- dplyr::select 
+```
+
+# Constants
+```{r}
+info_cols <- c("tax_id","taxonomy","type","kingdom","reference_length","mean","median","max")
+cohort_order <- c("TCGA COAD", "TCGA ESCC", "Golestan, Iran", "Shanxi, China", "ESCCAPE Kenya", "ESCCAPE Tanzania", "MUHAS Tanzania", "MUHAS Tanzania (RNA)", "UNC Project - Malawi (RNA)")
+```
+
+
+
+# Import Tz
+```{r}
+rna <- read_tsv("data/tanz_RNAseq_score.txt")
+wgs <- read_tsv("data/tanz_WGS_score.txt")
+metadata <- read_csv("data/tanzania-bams-2019-02-19.csv")
+
+# Because mycobacterium reads are actually human reads that are mismapped, remove them all
+rna <- rna %>%
+  filter(!grepl("Mycobacterium", taxonomy))
+wgs <- wgs %>%
+  filter(!grepl("Mycobacterium", taxonomy))
+
+# Format input files
+colnames(rna) <- str_replace_all(colnames(rna), ".pathseq.tsv","")
+colnames(wgs) <- str_replace_all(colnames(wgs), ".pathseq.tsv","")
+
+# Get list of non-sample, non-name columns
+info_cols <- colnames(rna)[1:9]
+info_cols <- info_cols[info_cols!='name']
+
+# Split wgs to saliva vs tumor
+
+# -- Make key to convert ID to type
+ID_to_type <- hash(metadata$`sample uuid`, metadata$`T/n`)
+
+# -- Get list of samples in each category
+tumor_list <- colnames(wgs)[10:length(wgs)][hash_lookup(ID_to_type, colnames(wgs)[10:length(wgs)]) == "Tumor"]
+saliva_list <- colnames(wgs)[10:length(wgs)][hash_lookup(ID_to_type, colnames(wgs)[10:length(wgs)]) == "Normal"]
+
+# -- Make a dataframe for each category
+wgs_tumor <- wgs[c(colnames(wgs)[1:9], tumor_list)]
+wgs_saliva <- wgs[c(colnames(wgs)[1:9], saliva_list)]
+
+# Make key to convert ID to name
+ID_to_name <- hash(metadata$`sample uuid`, metadata$sample_name)
+
+# Convert the column names in rna and wgs dataframes
+colnames(rna)[10:length(rna)] <- hash_lookup(ID_to_name, colnames(rna)[10:length(rna)])
+colnames(wgs_tumor)[10:length(wgs_tumor)] <- hash_lookup(ID_to_name, colnames(wgs_tumor)[10:length(wgs_tumor)])
+colnames(wgs_saliva)[10:length(wgs_saliva)] <- hash_lookup(ID_to_name, colnames(wgs_saliva)[10:length(wgs_saliva)])
+
+# Need to remove samples that lack metadata because they failed QC - i.e. are not 
+# the correct cancer type, etc.
+rna <- rna[colnames(rna)[!is.na(colnames(rna))]]
+```
+
+# Import Tz Metrics
+```{r}
+# import the files
+wgs_metrics <- read_delim("data/tanz_wgs.metrics.txt", delim="\t")
+rna_metrics <- read_delim("data/tanz_rnaseq.metrics.txt", delim="\t")
+
+# Split the wgs_metrics to tumor and saliva
+# Will use the existing tumor_list and saliva_list from above
+colnames(wgs_metrics) <- str_replace_all(colnames(wgs_metrics), ".pathseq.filter_metrics", "")
+wgs_metrics_tumor <- wgs_metrics[c("X1", tumor_list)]
+wgs_metrics_saliva <- wgs_metrics[c("X1", saliva_list)]
+
+# Format the metrics
+wgs_metrics_tumor <- format_metrics(wgs_metrics_tumor, ID_to_name)
+wgs_metrics_saliva <- format_metrics(wgs_metrics_saliva, ID_to_name)
+rna_metrics <- format_metrics(rna_metrics, ID_to_name)
+
+
+# For the WGS data, I processed the host-subtracted reads through PathSeq. 
+# This means I need to go back and, for the HOST_READS_FILTERED, add those
+# counts
+wgs_initial_counts <- read_delim("data/tz_WGS_COUNTS_of_reads_subtracted_before_pathseq.csv", delim=",", col_names=c("name", "count"))
+wgs_initial_counts$name <- str_replace_all(wgs_initial_counts$name, ".bam", "")
+
+# Make hash of initial human_counts
+wgs_initial_counts_map <- hash(wgs_initial_counts$name, wgs_initial_counts$count)
+
+# Will add the counts. Because the company may not have given all original BAMs, exlude
+# those samples that don't have original counts...
+wgs_metrics_tumor <- wgs_metrics_tumor %>%
+  mutate(HOST_READS_FILTERED = as.numeric(as.character(HOST_READS_FILTERED))) %>%
+  filter(name %in% wgs_initial_counts$name) %>%
+  mutate(HOST_READS_FILTERED = HOST_READS_FILTERED + hash_lookup(wgs_initial_counts_map, name))
+  
+wgs_metrics_saliva <- wgs_metrics_saliva %>%
+  mutate(HOST_READS_FILTERED = as.numeric(as.character(HOST_READS_FILTERED))) %>%
+  filter(name %in% wgs_initial_counts$name) %>%
+  mutate(HOST_READS_FILTERED = HOST_READS_FILTERED + hash_lookup(wgs_initial_counts_map, name))
+
+# Convert sample names to patient IDs
+wgs_metrics_tumor$name <- hash_lookup(ID_to_name, wgs_metrics_tumor$name)
+wgs_metrics_saliva$name <- hash_lookup(ID_to_name, wgs_metrics_saliva$name)
+rna_metrics$name <- hash_lookup(ID_to_name, rna_metrics$name)
+
+
+# For the RNA metrics, need to remove samples that don't have a name (meaning they're not in the key, probably because they are ruled out samples because they're not ESCC)
+rna_metrics <- rna_metrics %>%
+  filter(!is.na(name))
+
+
+# Make hashes for get # human reads
+tz_wgs_tumor_hu_hashmap <- hash(wgs_metrics_tumor$name, make_factor_numeric(wgs_metrics_tumor$HOST_READS_FILTERED))
+tz_wgs_saliva_hu_hashmap <- hash(wgs_metrics_saliva$name, make_factor_numeric(wgs_metrics_saliva$HOST_READS_FILTERED))
+tz_rna_hu_hashmap <- hash(rna_metrics$name, make_factor_numeric(rna_metrics$HOST_READS_FILTERED))
+```
+
+
+# Import Malawi
+```{r}
+malawi <- read_delim("data/malawi_rnaseq_partial.score.txt", delim="\t")
+
+# Format colnames
+colnames(malawi) <- str_replace_all(colnames(malawi), "_tumor.pathseq.tsv", "")
+colnames(malawi) <- str_replace_all(colnames(malawi), "_normal.pathseq.tsv", "") # NOTE - none of these RNA samples are actually normal! This was me miss-labeling things. There are NO normal RNAseq samples.
+```
+
+# Import Malawi metrics
+```{r}
+malawi_metrics <- read_delim("data/malawi_rnaseq.metrics.txt", delim="\t")
+
+# Format colnames
+# NOTE - none of these RNA samples are actually normal! This was me miss-labeling things. There are NO normal RNAseq samples.
+colnames(malawi_metrics) <- str_replace_all(colnames(malawi_metrics), "_tumor.pathseq.filter_metrics", "") %>%
+  str_replace_all("_normal.pathseq.filter_metrics", "")
+
+malawi_metrics <- format_metrics(malawi_metrics)
+
+#Make hash
+malawi_hu_hashmap <- hash(malawi_metrics$name, make_factor_numeric(malawi_metrics$HOST_READS_FILTERED))
+```
+
+
+# Import mutographs
+```{r}
+mutographs <- read_delim("data/mutographs/mutographs1_5.score.txt", delim="\t")
+mutographs_key <- read_delim("data/mutographs/mutographs_key.txt", delim="\t")
+
+# Remove the obsolete blood samples
+blood_samples <- colnames(mutographs)[grep("blood", colnames(mutographs))]
+mutographs <- mutographs %>%
+  select(-blood_samples)
+
+# Format the column names
+colnames(mutographs) <- basename(colnames(mutographs)) %>%
+  str_replace_all("_tumor", "") %>%
+  str_replace_all(".pathseq.txt", "")
+
+# Patients 42 and 43 are split, so need to re-label the second samples and then consolidate them
+#--------------------------------------------------------------------------------------------------#
+colnames(mutographs)[colnames(mutographs) == "42"][2] <- "42.1"
+colnames(mutographs)[colnames(mutographs) == "43"][2] <- "43.1"
+
+
+# Make character for better handling
+colnames(mutographs) <- as.character(colnames(mutographs))
+
+
+vals_42 <- mutographs %>%
+  pull("42")
+vals_42.1 <- mutographs %>%
+  pull("42.1")
+vals_42_agg <- vals_42 + vals_42.1
+mutographs$`42` <- vals_42_agg
+mutographs$`42.1` <- NULL
+
+vals_43 <- mutographs %>%
+  pull("43")
+vals_43.1 <- mutographs %>%
+  pull("43.1")
+vals_43_agg <- vals_43 + vals_43.1
+mutographs$`43` <- vals_43_agg
+mutographs$`43.1` <- NULL
+
+# Turn sample numbers back to numeric...
+colnames(mutographs)[7:ncol(mutographs)] <- as.numeric(colnames(mutographs)[7:ncol(mutographs)])
+#--------------------------------------------------------------------------------------------------#
+
+
+# Make a hashmap to convert case_identifier to country
+mutographs_hashmap <- hash(as.factor(mutographs_key$case_identifier), mutographs_key$country)
+  
+
+
+# Make copies of mutographs that are split by cohort - Tz, Kenya, China, Iran
+muto_tz_list <- colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "Tanzania"]
+muto_china_list <- colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "China"]
+muto_kenya_list <-  colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "Kenya"]
+muto_iran_list <-  colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "Iran"]
+
+mutographs_tz <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_tz_list)
+mutographs_china <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_china_list)
+mutographs_kenya <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_kenya_list)
+mutographs_iran <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_iran_list)
+```
+
+# Import Mutographs metrics
+```{r}
+mutographs_metrics <- read_delim("data/mutographs/mutographs1_5.metrics.txt", delim="\t")
+
+# Remove the obsolete blood samples
+blood_samples <- colnames(mutographs_metrics)[grep("blood", colnames(mutographs_metrics))]
+mutographs_metrics <- mutographs_metrics %>%
+  select(-blood_samples)
+
+# Format the column names
+colnames(mutographs_metrics) <- basename(colnames(mutographs_metrics)) %>%
+  str_replace_all("_tumor", "") %>%
+  str_replace_all(".filter_metrics.txt", "")
+
+
+
+# Patients 42 and 43 are split, so need to re-label the second samples and then consolidate them
+#--------------------------------------------------------------------------------------------------#
+colnames(mutographs_metrics)[colnames(mutographs_metrics) == "42"][2] <- "42.1"
+colnames(mutographs_metrics)[colnames(mutographs_metrics) == "43"][2] <- "43.1"
+
+vals_42 <- mutographs_metrics %>%
+  pull("42")
+vals_42.1 <- mutographs_metrics %>%
+  pull("42.1")
+vals_42_agg <- vals_42 + vals_42.1
+mutographs_metrics$`42` <- vals_42_agg
+mutographs_metrics$`42.1` <- NULL
+
+vals_43 <- mutographs_metrics %>%
+  pull("43")
+vals_43.1 <- mutographs_metrics %>%
+  pull("43.1")
+vals_43_agg <- vals_43 + vals_43.1
+mutographs_metrics$`43` <- vals_43_agg
+mutographs_metrics$`43.1` <- NULL
+#--------------------------------------------------------------------------------------------------#
+
+# Format them
+mutographs_metrics <- format_metrics(mutographs_metrics)
+
+
+
+# Import the counts of the human-mapped reads that were not processed through PathSeq
+mutographs_hu_read_counts <- read_delim("data/mutographs/mutographs_human_mapped_counts.txt", delim="\t")
+mutographs_hu_read_counts$name <- as.character(mutographs_hu_read_counts$name)
+mutographs_hu_read_counts$count <- as.numeric(mutographs_hu_read_counts$count)
+mutographs_hu_read_counts_hashmap <- hash(mutographs_hu_read_counts$name, mutographs_hu_read_counts$count)
+
+# Add counts to the pathseq metrics file
+mutographs_metrics <- mutographs_metrics %>%
+  mutate(HOST_READS_FILTERED = as.numeric(HOST_READS_FILTERED) + hash_lookup(mutographs_hu_read_counts_hashmap,name))
+
+mutographs_hu_hashmap <- hash(mutographs_metrics$name, make_factor_numeric(mutographs_metrics$HOST_READS_FILTERED))
+
+```
+
+# Import TCGA ESCC
+```{r}
+#------------------------------------------------------------------------------------------#
+# Input data and format data
+#------------------------------------------------------------------------------------------#
+tcga_wgs <- read_tsv("data/tcga_escc_a_data/tcga_esca_wgs_score.txt")
+tcga_clin_info <- read_tsv("data/tcga_escc_a_data/TCGA_ESCA-C_clinical_data.tsv")
+
+# Because mycobacterium reads are actually human reads that are mismapped, remove them all
+tcga_wgs <- tcga_wgs %>%
+  filter(!grepl("Mycobacterium", taxonomy))
+
+# Remove normal samples from input dataframes
+tcga_wgs <- tcga_wgs %>%
+  select(-contains("NT")) %>%
+  select(-contains("TM"))
+
+# Format colnames to remove .pathseq.tsv and such
+colnames(tcga_wgs) <- str_replace_all(colnames(tcga_wgs), "-TP.pathseq.tsv", "")
+
+# Format clinical names
+tcga_clin_info$submitter_id <- str_replace_all(tcga_clin_info$submitter_id, "TCGA", "ESCA")
+
+# make hashmap to convert name to diagnosis
+tcga_id_to_type <- hash(tcga_clin_info$submitter_id, tcga_clin_info$primary_diagnosis)
+
+# Select only squamous cancers...
+wgs_types <- hash_lookup(tcga_id_to_type, colnames(tcga_wgs)[7:length(tcga_wgs)])
+wgs_cols_to_keep <- c(colnames(tcga_wgs)[1:6], colnames(tcga_wgs)[7:length(tcga_wgs)][grepl("Squamous", wgs_types)])
+tcga_wgs <- tcga_wgs %>%
+  select(wgs_cols_to_keep)
+
+# Also bring in country of origin information
+tcga_clinical_cbio <- read_delim("data/cBioportal_TCGA_ESCAcohort_clinical/esca_tcga_clinical_data.tsv", delim="\t")
+
+# Make annotation and add to dataframe
+tcga_ID_to_country <- hash(str_replace_all(tcga_clinical_cbio$`Patient ID`, "TCGA", "ESCA"), tcga_clinical_cbio$`Tumor sample procurement country`)
+
+# For TCGA, I will just split into separate countries first thing.
+
+
+
+
+tcga_RU <- tcga_wgs %>%
+  select(colnames(tcga_wgs)[1:6],
+         colnames(tcga_wgs)[7:length(tcga_wgs)][hash_lookup(tcga_ID_to_country, colnames(tcga_wgs)[7:length(tcga_wgs)]) == "Russia"])
+
+tcga_UKR <- tcga_wgs %>%
+  select(colnames(tcga_wgs)[1:6],
+         colnames(tcga_wgs)[7:length(tcga_wgs)][hash_lookup(tcga_ID_to_country, colnames(tcga_wgs)[7:length(tcga_wgs)]) == "Ukraine"])
+
+tcga_USA <- tcga_wgs %>%
+  select(colnames(tcga_wgs)[1:6],
+         colnames(tcga_wgs)[7:length(tcga_wgs)][hash_lookup(tcga_ID_to_country, colnames(tcga_wgs)[7:length(tcga_wgs)]) == "United States"])
+
+tcga_VT <- tcga_wgs %>%
+  select(colnames(tcga_wgs)[1:6],
+         colnames(tcga_wgs)[7:length(tcga_wgs)][hash_lookup(tcga_ID_to_country, colnames(tcga_wgs)[7:length(tcga_wgs)]) == "Vietnam"])
+```
+
+# Import TCGA ESCC metrics
+```{r}
+tcga_metrics <- read_delim("data/tcga_escc_a_data/tcga_esca_wgs.pathseq.metrics.txt", delim="\t")
+
+# Format colnames
+colnames(tcga_metrics) <- colnames(tcga_metrics) %>% 
+  str_replace_all(".pathseq.filter_metrics", "") %>%
+  str_replace_all("-TP", "")
+
+tcga_metrics <- format_metrics(tcga_metrics)
+
+#Make hash
+tcga_hu_hashmap <- hash(tcga_metrics$name, make_factor_numeric(tcga_metrics$HOST_READS_FILTERED))
+```
+
+# Import TCGA COAD tumor for pos control
+```{r}
+# THIS IS FOR RNASEQ
+# COAD_tumor <- read_tsv("data/tcga_coad/COAD_tumor.score.txt")
+# colnames(COAD_tumor) <- str_replace_all(colnames(COAD_tumor), "-TP.pathseq.tsv", "")
+# 
+# # Subset for 50 samples
+# COAD_tumor <- COAD_tumor[1:55]
+
+
+# IF DOING WGS INSTEAD
+COAD_tumor <- read_tsv("data/tcga_coad/COAD_WGS/COAD_WGS.score.txt")
+colnames(COAD_tumor) <- str_replace_all(colnames(COAD_tumor), ".unmapped.pathseq.txt", "")
+```
+
+# Import TCGA COAD tumor for pos control - METRICS
+```{r}
+# FOR RNASEQ
+# COAD_tumor_metrics <- read_tsv("data/tcga_coad/COAD_tumor.metrics.txt")
+# colnames(COAD_tumor_metrics) <- str_replace_all(colnames(COAD_tumor_metrics), "-TP.pathseq.filter_metrics", "")
+# COAD_tumor_metrics <- format_metrics(COAD_tumor_metrics)
+
+# FOR WGS
+COAD_tumor_metrics <- read_delim("data/tcga_coad/COAD_WGS/COAD_WGS.metrics.txt", delim="\t")
+colnames(COAD_tumor_metrics) <- str_replace_all(colnames(COAD_tumor_metrics), ".unmapped.filter_metrics.txt", "")
+COAD_tumor_metrics <- format_metrics(COAD_tumor_metrics)
+
+
+
+# Make a hash to add original counts
+COAD_tumor_original_mapped_counts <- read_csv("data/tcga_coad/COAD_WGS/COAD_WGS_OG_MAPPED_COUNTS.csv", col_names = c("sample", "count"))
+COAD_tumor_original_mapped_counts$sample <- str_replace_all(COAD_tumor_original_mapped_counts$sample, ".bam", "")
+COAD_tumor_original_counts_hash <- hash(COAD_tumor_original_mapped_counts$sample, COAD_tumor_original_mapped_counts$count)
+
+# Add OG counts 
+COAD_tumor_metrics <- COAD_tumor_metrics %>%
+  mutate(HOST_READS_FILTERED = make_factor_numeric(HOST_READS_FILTERED) + hash_lookup(COAD_tumor_original_counts_hash, name))
+
+#Make hash
+COAD_tumor_hashmap <- hash(COAD_tumor_metrics$name, make_factor_numeric(COAD_tumor_metrics$HOST_READS_FILTERED))
+```
+
+
+# Make copeis of the dataframes that are normalized to # human reads
+```{r}
+
+# Tz Cohort
+wgs_tumor_hu_norm <- normalize_to_human_reads(wgs_tumor, tz_wgs_tumor_hu_hashmap, number_of_nonname_columns = length(colnames(wgs)[colnames(wgs) %in% info_cols]))
+rna_hu_norm <- normalize_to_human_reads(rna, tz_wgs_tumor_hu_hashmap, number_of_nonname_columns = length(colnames(rna)[colnames(rna) %in% info_cols]))
+
+# Malawi cohort
+malawi_hu_norm <- normalize_to_human_reads(malawi, malawi_hu_hashmap, number_of_nonname_columns = length(colnames(malawi)[colnames(malawi) %in% info_cols]))
+
+# Mutographs - both the aggregated one and the split ones to keep options open
+mutographs_hu_norm <- normalize_to_human_reads(mutographs, mutographs_hu_hashmap, number_of_nonname_columns = length(colnames(mutographs)[colnames(mutographs) %in% info_cols]))
+
+mutographs_tz_hu_norm <- normalize_to_human_reads(mutographs_tz, mutographs_hu_hashmap, number_of_nonname_columns = length(colnames(mutographs_tz)[colnames(mutographs_tz) %in% info_cols]))
+mutographs_china_hu_norm <- normalize_to_human_reads(mutographs_china, mutographs_hu_hashmap, number_of_nonname_columns = length(colnames(mutographs_china)[colnames(mutographs_china) %in% info_cols]))
+mutographs_kenya_hu_norm <- normalize_to_human_reads(mutographs_kenya, mutographs_hu_hashmap, number_of_nonname_columns = length(colnames(mutographs_kenya)[colnames(mutographs_kenya) %in% info_cols]))
+mutographs_iran_hu_norm <- normalize_to_human_reads(mutographs_iran, mutographs_hu_hashmap, number_of_nonname_columns = length(colnames(mutographs_iran)[colnames(mutographs_iran) %in% info_cols]))
+
+
+# TCGA - also for both aggregated and split tables.
+tcga_wgs_hu_norm <- normalize_to_human_reads(tcga_wgs, tcga_hu_hashmap, number_of_nonname_columns = length(colnames(tcga_wgs)[colnames(tcga_wgs) %in% info_cols]))
+
+tcga_RU_hu_norm <- normalize_to_human_reads(tcga_RU, tcga_hu_hashmap, number_of_nonname_columns = length(colnames(tcga_RU)[colnames(tcga_RU) %in% info_cols]))
+tcga_UKR_hu_norm <- normalize_to_human_reads(tcga_UKR, tcga_hu_hashmap, number_of_nonname_columns = length(colnames(tcga_UKR)[colnames(tcga_UKR) %in% info_cols]))
+tcga_USA_hu_norm <- normalize_to_human_reads(tcga_USA, tcga_hu_hashmap, number_of_nonname_columns = length(colnames(tcga_USA)[colnames(tcga_USA) %in% info_cols]))
+tcga_VT_hu_norm <- normalize_to_human_reads(tcga_VT, tcga_hu_hashmap, number_of_nonname_columns = length(colnames(tcga_VT)[colnames(tcga_VT) %in% info_cols]))
+
+# For COAD tumor
+COAD_tumor_hu_norm <- normalize_to_human_reads(COAD_tumor, COAD_tumor_hashmap, number_of_nonname_columns = length(colnames(COAD_tumor)[colnames(COAD_tumor) %in% info_cols]))
+
+
+
+```
+
+# Making aggregated copies for each dataframe for faceted plots
+```{r}
+
+# First minimize the columns present in each tibble - only keep tax_id, name, kingdom for the info columns. 
+cols_to_drop <- c("reference_length", "mean", "median", "max")
+
+wgs_tumor <- wgs_tumor %>%
+  select(-cols_to_drop)
+rna <- rna %>%
+  select(-cols_to_drop)
+malawi <- malawi %>%
+  select(-cols_to_drop[1])
+tcga_wgs <- tcga_wgs %>%
+  select(-cols_to_drop[1])
+mutographs <- mutographs %>%
+  select(-cols_to_drop[1])
+COAD_tumor <- COAD_tumor %>%
+  select(-cols_to_drop[1])
+
+wgs_tumor_hu_norm <- wgs_tumor_hu_norm %>%
+  select(-cols_to_drop)
+rna_hu_norm <- rna_hu_norm %>%
+  select(-cols_to_drop)
+malawi_hu_norm <- malawi_hu_norm %>%
+  select(-cols_to_drop[1])
+tcga_wgs_hu_norm <- tcga_wgs_hu_norm %>%
+  select(-cols_to_drop[1])
+mutographs_hu_norm <- mutographs_hu_norm %>%
+  select(-cols_to_drop[1])
+COAD_tumor_hu_norm <- COAD_tumor_hu_norm %>%
+  select(-cols_to_drop[1])
+
+
+# Need to do some labeling first -- the MDEC samples, need to label the RNA as RNA in the colnames.
+rna_4_AGG <- rna
+rna_hu_norm_4_AGG <- rna_hu_norm
+
+colnames(rna_4_AGG) <-  str_replace_all(colnames(rna_4_AGG), "MDEC", "RNA MDEC")
+colnames(rna_hu_norm_4_AGG) <-  str_replace_all(colnames(rna_hu_norm_4_AGG), "MDEC", "RNA MDEC")
+
+# Now concatenate
+raw_agg <- wgs_tumor %>%
+  full_join(rna_4_AGG) %>%
+  full_join(malawi) %>%
+  full_join(tcga_wgs) %>%
+  full_join(mutographs) %>%
+  full_join(COAD_tumor)
+raw_agg[is.na(raw_agg)] <- 0
+
+
+hu_norm <- wgs_tumor_hu_norm %>%
+  full_join(rna_hu_norm_4_AGG) %>%
+  full_join(malawi_hu_norm) %>%
+  full_join(tcga_wgs_hu_norm) %>%
+  full_join(mutographs_hu_norm) %>%
+  full_join(COAD_tumor_hu_norm)
+hu_norm[is.na(hu_norm)] <- 0
+
+# Only keep samples that are present in both hu_norm and raw
+shared <- colnames(raw_agg)[colnames(raw_agg) %in% colnames(hu_norm)]
+raw_agg <- raw_agg %>%
+  select(shared)
+hu_norm <- hu_norm %>%
+  select(shared)
+
+# Get cohort key (only samples that are in the aggregated dataframes)
+get_cohort_tibble <- function(in_tbl, must_be_in_this_vector, cohort_name, info_cols=c("tax_id","name", "taxonomy","type","kingdom","reference_length","mean","median","max")) {
+  
+  # Find the info cols that are in the in_tbl
+  info_cols <- info_cols[info_cols %in% colnames(in_tbl)]
+  
+  # Find the colnames
+  samples <- colnames(in_tbl)
+  samples <- samples[!samples %in% info_cols]
+  samples <- samples[samples %in% must_be_in_this_vector]
+  
+  tibble(sample_name = samples,
+         cohort = rep(cohort_name, length(sample_name)))
+}
+  
+# Make cohort key and hashmap
+cohort_key <- rbind(
+  get_cohort_tibble(wgs_tumor, shared, "MUHAS Tanzania"),
+  get_cohort_tibble(rna_4_AGG, shared, "MUHAS Tanzania (RNA)"),
+  get_cohort_tibble(malawi, shared, "UNC Project - Malawi (RNA)"),
+  get_cohort_tibble(mutographs_tz, shared, "ESCCAPE Tanzania"),
+  get_cohort_tibble(mutographs_iran, shared, "Golestan, Iran"),
+  get_cohort_tibble(mutographs_kenya, shared, "ESCCAPE Kenya"),
+  get_cohort_tibble(mutographs_china, shared, "Shanxi, China"),
+  get_cohort_tibble(tcga_RU, shared, "TCGA Russia"),
+  get_cohort_tibble(tcga_UKR, shared, "TCGA Ukraine"),
+  get_cohort_tibble(tcga_USA, shared, "TCGA USA"),
+  get_cohort_tibble(tcga_VT, shared, "TCGA Vietnam"),
+  get_cohort_tibble(COAD_tumor, shared, "TCGA COAD")
+)
+
+cohort_hashmap <- hash(cohort_key$sample_name, cohort_key$cohort)
+
+# Also make a version where TCGA is all one cohort..
+cohort_key_TCGAMERGED <- cohort_key %>%
+  mutate(cohort = ifelse(grepl("ESCA", sample_name), "TCGA ESCC", cohort))
+cohort_hashmap_TCGAMERGED <- hash(cohort_key_TCGAMERGED$sample_name, cohort_key_TCGAMERGED$cohort)
+
+
+
+
+```
+
+# Plot absolute bacterial burdens
+```{r}
+
+bacterial_burdens <- hu_norm %>% 
+  extract_data("Bacteria", "superkingdom", info_cols) %>%
+  melt() %>%
+  mutate(cohort=hash_lookup(cohort_hashmap_TCGAMERGED, variable))
+
+
+colnames(bacterial_burdens) <- c("name", "sample_ID", "read_count", "cohort")
+
+
+# Add analyte type
+bacterial_burdens <- bacterial_burdens %>%
+  mutate(Sample_type = ifelse(grepl("RNA", cohort), "ESCC RNA", "ESCC DNA")) %>%
+  mutate(Sample_type = ifelse(grepl("COAD", cohort), "COAD DNA", Sample_type))
+
+bacterial_burdens$cohort <- factor(bacterial_burdens$cohort, ordered=T, levels=cohort_order)
+
+
+bacterial_burdens_plt <- ggplot(bacterial_burdens) +
+  geom_boxplot(
+    aes(x=cohort, y=read_count, fill=Sample_type)
+  ) +
+  geom_jitter(
+    aes(x=cohort, y=read_count)
+  ) +
+  coord_flip() +
+  theme_minimal(base_size=15) +
+  scale_y_continuous(trans="log10", labels=comma) +
+  scale_fill_manual(values=c("#C5283D", "#fca311", "#a8dadc")) +
+  xlab("Country") + ylab("Bacterial reads per million human reads.") +
+  guides(fill = guide_legend(reverse=T), title="Sample Type") +
+  theme(axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(color="black"))
+bacterial_burdens_plt 
+
+
+ggsave("figs/separate_panels/Fig1B.pdf", bacterial_burdens_plt, width=20, height=10, units="cm")
+ggsave("figs/separate_panels/Fig1B.svg", bacterial_burdens_plt, width=20, height=10, units="cm")
+
+
+#40030
+
+```
+
+
+# Alpha diversity
+```{r}
+library(vegan)
+
+get_genus_alpha_diversity <- function(in_tbl) {
+  genus <- extract_data(in_tbl, "Bacteria", "genus", info_cols)
+  
+  names <- names(apply(genus[2:length(genus)], 2, diversity))
+  alpha_div <- as.numeric(apply(genus[2:length(genus)], 2, diversity))
+  
+  tibble(name = names, alpha_diversity = alpha_div)
+}
+
+
+aggregated_alpha_div <- get_genus_alpha_diversity(raw_agg)
+
+
+# Label cohort, analyte type, and order
+aggregated_alpha_div <- aggregated_alpha_div %>%
+  mutate(cohort=hash_lookup(cohort_hashmap_TCGAMERGED, name)) %>%
+  mutate(order=match(cohort, cohort_order)) %>%
+  mutate(Sample_type = ifelse(grepl("RNA", cohort), "ESCC RNA", "ESCC DNA")) %>%
+  mutate(Sample_type = ifelse(grepl("COAD", cohort), "COAD DNA", Sample_type))
+
+
+# Plot it
+aggregated_alpha_div_plt <- ggplot(aggregated_alpha_div) +
+  geom_boxplot(
+    aes(x=reorder(cohort, order), y=alpha_diversity, fill=Sample_type)
+  ) +
+  geom_jitter(
+    aes(x=cohort, y=alpha_diversity)
+  ) +
+  coord_flip() +
+  theme_minimal(base_size=15)+
+  scale_fill_manual(values=c("#C5283D", "#fca311", "#a8dadc")) +
+  xlab("Country") + ylab("Shannon Diversity") +
+  guides(fill = guide_legend(reverse=T), title="Sample Type")  +
+  theme(axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(color="black"))
+aggregated_alpha_div_plt
+
+
+ggsave("figs/separate_panels/Fig1C.pdf", aggregated_alpha_div_plt, width=20, height=10, units="cm")
+ggsave("figs/separate_panels/Fig1C.svg", aggregated_alpha_div_plt, width=20, height=10, units="cm")
+```
+
+
+
+# Phylum-level heatmaps separated by cohort - WITH COAD
+```{r}
+extract_phyla_and_set_colnames <- function(in_tbl, cohort_name){
+
+  info_cols <- colnames(in_tbl)[colnames(in_tbl) %in% info_cols]
+  in_tbl %>% extract_data("Bacteria", "phylum", info_cols) %>% set_colnames(c("name", rep(cohort_name, length(in_tbl)-length(info_cols))))
+}
+
+
+# Merge 'em. Need to do it as data.frames because tibbles don't like having the same colname.
+merged_phyla <- data.frame(name="") %>%
+  merge(
+    malawi %>% extract_phyla_and_set_colnames("UNC Project - Malawi (RNA)") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    rna %>% extract_phyla_and_set_colnames("MUHAS Tanzania (RNA)") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    wgs_tumor %>% extract_phyla_and_set_colnames("MUHAS Tanzania") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_tz %>% extract_phyla_and_set_colnames("ESCCAPE Tanzania") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_kenya %>% extract_phyla_and_set_colnames("ESCCAPE Kenya") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_china %>% extract_phyla_and_set_colnames("Shanxi, China") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_iran %>% extract_phyla_and_set_colnames("Golestan, Iran") %>% as.data.frame(), by="name", all=T
+  ) %>%
+   merge(
+    tcga_wgs %>% extract_phyla_and_set_colnames("TCGA") %>% as.data.frame(), by="name", all=T
+  ) %>%
+   merge(
+    COAD_tumor %>% extract_phyla_and_set_colnames("COAD") %>% as.data.frame(), by="name", all=T
+  )
+merged_phyla[is.na(merged_phyla)] <- 0
+
+
+# Make annotations for the pheatmap
+get_length_of_sample_cols <- function(in_tbl, info_cols){
+  length(colnames(in_tbl)[!colnames(in_tbl) %in% c(info_cols, "name")])
+}
+
+
+col_annotation <- data.frame(
+  Country = c(
+    rep("UNC Project - Malawi (RNA)", get_length_of_sample_cols(malawi, info_cols)),
+    rep("MUHAS Tanzania (RNA)", get_length_of_sample_cols(rna, info_cols)),
+    rep("MUHAS Tanzania", get_length_of_sample_cols(wgs_tumor, info_cols)),
+    rep("ESCCAPE Tanzania", get_length_of_sample_cols(mutographs_tz, info_cols)),
+    rep("ESCCAPE Kenya", get_length_of_sample_cols(mutographs_kenya, info_cols)),
+    rep("Shanxi, China", get_length_of_sample_cols(mutographs_china, info_cols)),
+    rep("Golestan, Iran", get_length_of_sample_cols(mutographs_iran, info_cols)),
+    rep("TCGA ESCC", get_length_of_sample_cols(tcga_wgs, info_cols)),
+    rep("TCGA COAD", get_length_of_sample_cols(COAD_tumor, info_cols))
+  )
+)
+rownames(col_annotation) <- colnames(merged_phyla)[2:length(merged_phyla)]
+col_annotation$Country <- factor(col_annotation$Country,
+                                           levels=rev(c(cohort_order)),
+                                           ordered=T
+                                          )
+# Find locations of the breaks
+sample_order_lengths <- c(get_length_of_sample_cols(malawi, info_cols),
+                          get_length_of_sample_cols(rna, info_cols),
+                          get_length_of_sample_cols(wgs_tumor, info_cols),
+                          get_length_of_sample_cols(mutographs_tz, info_cols),
+                          get_length_of_sample_cols(mutographs_kenya, info_cols),
+                          get_length_of_sample_cols(mutographs_china, info_cols),
+                          get_length_of_sample_cols(mutographs_iran, info_cols),
+                          get_length_of_sample_cols(tcga_wgs, info_cols),
+                          get_length_of_sample_cols(COAD_tumor, info_cols)
+)
+sample_order_breaks <- cumsum(sample_order_lengths)
+
+ann_colors = list(
+  Country = c("UNC Project - Malawi (RNA)" = "#000000",
+                        "MUHAS Tanzania (RNA)" = "#54478C",
+                        "MUHAS Tanzania" = "#2C699A",
+                        "ESCCAPE Tanzania"= "#048BA8",
+                        "ESCCAPE Kenya" = "#0DB39E",
+                        "Shanxi, China" = "#16DB93",
+                        "Golestan, Iran" = "#83E377",
+                        "TCGA ESCC"  = "#B9E769",
+                        "TCGA COAD" = "#C5283D"
+              )
+)
+
+merged_phyla_pheatmap_plt <- as.ggplot(
+  merged_phyla %>%
+  relative_abundance() %>%
+  get_top_by_rowMeans(5) %>%
+  name_col_to_rownames() %>%
+  pheatmap(
+    show_colnames     = F,
+    cluster_cols      = F,
+    cluster_rows      = F,
+    annotation_col    = col_annotation,
+    gaps_col          = sample_order_breaks,
+    border_color      = "black",
+    color             = colorRampPalette(brewer.pal(n = 7, name ="Oranges"))(100),
+    annotation_colors = ann_colors,
+    cellheight = 50,
+    fontsize = 12,
+    )
+)
+merged_phyla_pheatmap_plt
+
+
+ggsave("figs/separate_panels/Fig1D.pdf", merged_phyla_pheatmap_plt, width=20, height=10, units="cm")
+ggsave("figs/separate_panels/Fig1D.svg", merged_phyla_pheatmap_plt, width=20, height=10, units="cm")
+# note - set pheatmap size to 0.8 * ggplot base_size and font ends up the same size in the end.
+
+?pheatmap
+```
+
+
+# Assemble figure
+```{r}
+
+figure1 <- (
+  bacterial_burdens_plt + 
+   aggregated_alpha_div_plt + theme(axis.title.y = element_blank(),
+                                    axis.text.y = element_blank()) +
+   plot_layout(guides = 'collect')
+ ) / 
+  merged_phyla_pheatmap_plt
+
+figure1 <- figure1 + plot_annotation(tag_levels = list(c("B", "C", "D")))
+
+ggsave("figs/export_for_assembly/R/figure1.pdf", figure1, width=30, height=22, units="cm")
+ggsave("figs/export_for_assembly/R/figure1.svg", figure1, width=30, height=22, units="cm")
+
+
+
+```
+
+
+
+# Supplement 1A - metrics boxplot
+```{r}
+
+merged_metrics <- 
+  rbind(
+    wgs_metrics_saliva %>% 
+      mutate(name = paste(name, "saliva", sep = "_")) %>%
+      select(name, HOST_READS_FILTERED, FINAL_TOTAL_READS),
+    malawi_metrics %>% select(name, HOST_READS_FILTERED, FINAL_TOTAL_READS),
+    rna_metrics %>% 
+      mutate(name = paste(name, "rna", sep = "_")) %>%
+      select(name, HOST_READS_FILTERED, FINAL_TOTAL_READS),
+    wgs_metrics_tumor %>% select(name, HOST_READS_FILTERED, FINAL_TOTAL_READS),
+    mutographs_metrics %>% select(name, HOST_READS_FILTERED, FINAL_TOTAL_READS),
+    tcga_metrics %>% select(name, HOST_READS_FILTERED, FINAL_TOTAL_READS),
+    COAD_tumor_metrics %>% select(name, HOST_READS_FILTERED, FINAL_TOTAL_READS)
+  )
+
+
+
+
+merged_metrics <- merged_metrics %>%
+  melt(id.vars = "name") %>%
+  mutate(cohort = hash_lookup(cohort_hashmap_TCGAMERGED, name)) %>%
+  mutate(cohort = ifelse(grepl("saliva", name), "Tanzania Saliva", cohort)) %>%
+  mutate(cohort = ifelse(grepl("rna", name), "MUHAS Tanzania (RNA)", cohort)) %>%
+  filter(!is.na(cohort)) %>%
+  mutate(variable = str_replace_all(variable, "HOST_READS_FILTERED", "Pathseq Human-mapped Reads")) %>%
+  mutate(variable = str_replace_all(variable, "FINAL_TOTAL_READS", "Pathseq Microbe-mapped Reads")) %>%
+  mutate(value = as.numeric(value)) %>%
+  mutate(variable = factor(variable, ordered=T, levels=c("Pathseq Human-mapped Reads", "Pathseq Microbe-mapped Reads"))) %>%
+  mutate(cohort = factor(cohort, ordered=T, levels=rev(c(cohort_order, "Tanzania Saliva"))))
+
+  
+metrics_boxplt <- merged_metrics %>%
+  ggplot() +
+  geom_boxplot(
+    aes(
+      x = cohort,
+      y = value,
+      fill=variable
+    ),
+    position = "dodge",
+    outlier.shape = NA
+  ) +
+  theme_classic(base_size=12) +
+  scale_y_continuous(trans="log10", labels=comma) +
+  facet_wrap(~cohort, scale="free") +
+  scale_fill_manual(values=c("#2a9d8f", "#f4a261")) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_blank(),
+        axis.title.x = element_blank(),
+        legend.title = element_blank(),
+        legend.position = c(0.6, .15)) +
+  ylab("Number of Reads")
+
+metrics_boxplt
+
+ggsave("figs/export_for_assembly/R/figureS1A_metrics_boxplot.pdf", metrics_boxplt, width=30, height=20, units="cm")
+ggsave("figs/export_for_assembly/R/figureS1A_metrics_boxplot.svg", metrics_boxplt, width=30, height=20, units="cm")
+```
+
+
+
+# Supplement 1B - extended phyla heatmap 
+```{r}
+extended_phyla_heatmap <-
+  merged_phyla %>%
+  relative_abundance() %>%
+  get_top_by_rowMeans(15) %>%
+  name_col_to_rownames() %>%
+  pheatmap(
+    show_colnames     = F,
+    cluster_cols      = F,
+    cluster_rows      = F,
+    annotation_col    = col_annotation,
+    gaps_col          = sample_order_breaks,
+    border_color      = "black",
+    color             = colorRampPalette(brewer.pal(n = 7, name ="Oranges"))(100),
+    annotation_colors = ann_colors,
+    fontsize_row = 15,
+    )
+
+extended_phyla_heatmap
+
+ggsave("figs/export_for_assembly/R/figureS1B_extended_phyla_heatmap.pdf", extended_phyla_heatmap, width=20, height=10, units="cm")
+ggsave("figs/export_for_assembly/R/figureS1B_extended_phyla_heatmap.svg", extended_phyla_heatmap, width=20, height=10, units="cm")
+
+```
+
+
+
+# Supplement 1C - genus-level pheatmap
+```{r}
+
+extract_genus_and_set_colnames <- function(in_tbl, cohort_name){
+
+  info_cols <- colnames(in_tbl)[colnames(in_tbl) %in% info_cols]
+  in_tbl %>% extract_data("Bacteria", "genus", info_cols) %>% set_colnames(c("name", rep(cohort_name, length(in_tbl)-length(info_cols))))
+}
+
+
+# Merge 'em. Need to do it as data.frames because tibbles don't like having the same colname.
+merged_genera <- data.frame(name="") %>%
+  merge(
+    malawi %>% extract_genus_and_set_colnames("UNC Project - Malawi (RNA)") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    rna %>% extract_genus_and_set_colnames("MUHAS Tanzania (RNA)") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    wgs_tumor %>% extract_genus_and_set_colnames("MUHAS Tanzania") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_tz %>% extract_genus_and_set_colnames("ESCCAPE Tanzania") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_kenya %>% extract_genus_and_set_colnames("ESCCAPE Kenya") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_china %>% extract_genus_and_set_colnames("Shanxi, China") %>% as.data.frame(), by="name", all=T
+  ) %>%
+  merge(
+    mutographs_iran %>% extract_genus_and_set_colnames("Golestan, Iran") %>% as.data.frame(), by="name", all=T
+  ) %>%
+   merge(
+    tcga_wgs %>% extract_genus_and_set_colnames("TCGA ESCC") %>% as.data.frame(), by="name", all=T
+  ) %>%
+   merge(
+    COAD_tumor %>% extract_genus_and_set_colnames("TCGA COAD") %>% as.data.frame(), by="name", all=T
+  )
+merged_genera[is.na(merged_genera)] <- 0
+
+
+# Make annotations for the pheatmap
+get_length_of_sample_cols <- function(in_tbl, info_cols){
+  length(colnames(in_tbl)[!colnames(in_tbl) %in% c(info_cols, "name")])
+}
+
+
+col_annotation <- data.frame(
+  Country = c(
+    rep("UNC Project - Malawi (RNA)", get_length_of_sample_cols(malawi, info_cols)),
+    rep("MUHAS Tanzania (RNA)", get_length_of_sample_cols(rna, info_cols)),
+    rep("MUHAS Tanzania", get_length_of_sample_cols(wgs_tumor, info_cols)),
+    rep("ESCCAPE Tanzania", get_length_of_sample_cols(mutographs_tz, info_cols)),
+    rep("ESCCAPE Kenya", get_length_of_sample_cols(mutographs_kenya, info_cols)),
+    rep("Shanxi, China", get_length_of_sample_cols(mutographs_china, info_cols)),
+    rep("Golestan, Iran", get_length_of_sample_cols(mutographs_iran, info_cols)),
+    rep("TCGA ESCC", get_length_of_sample_cols(tcga_wgs, info_cols)),
+    rep("TCGA COAD", get_length_of_sample_cols(COAD_tumor, info_cols))
+  )
+)
+rownames(col_annotation) <- colnames(merged_genera)[2:length(merged_genera)]
+col_annotation$Country <- factor(col_annotation$Country,
+                                           levels=rev(c(cohort_order)),
+                                           ordered=T
+                                          )
+# Find locations of the breaks
+sample_order_lengths <- c(get_length_of_sample_cols(malawi, info_cols),
+                          get_length_of_sample_cols(rna, info_cols),
+                          get_length_of_sample_cols(wgs_tumor, info_cols),
+                          get_length_of_sample_cols(mutographs_tz, info_cols),
+                          get_length_of_sample_cols(mutographs_kenya, info_cols),
+                          get_length_of_sample_cols(mutographs_china, info_cols),
+                          get_length_of_sample_cols(mutographs_iran, info_cols),
+                          get_length_of_sample_cols(tcga_wgs, info_cols),
+                          get_length_of_sample_cols(COAD_tumor, info_cols)
+)
+sample_order_breaks <- cumsum(sample_order_lengths)
+
+ann_colors = list(
+  Country = c("UNC Project - Malawi (RNA)" = "#000000",
+                        "MUHAS Tanzania (RNA)" = "#54478C",
+                        "MUHAS Tanzania" = "#2C699A",
+                        "ESCCAPE Tanzania"= "#048BA8",
+                        "ESCCAPE Kenya" = "#0DB39E",
+                        "Shanxi, China" = "#16DB93",
+                        "Golestan, Iran" = "#83E377",
+                        "TCGA ESCC"  = "#B9E769",
+                        "TCGA COAD" = "#C5283D"
+              )
+)
+
+merged_genera_pheatmap_plt <-
+  merged_genera %>%
+  relative_abundance() %>%
+  get_top_by_rowMeans(15) %>%
+  name_col_to_rownames() %>%
+  pheatmap(
+    show_colnames     = F,
+    cluster_cols      = F,
+    cluster_rows      = F,
+    annotation_col    = col_annotation,
+    gaps_col          = sample_order_breaks,
+    border_color      = "black",
+    color             = colorRampPalette(brewer.pal(n = 7, name ="Oranges"))(100),
+    annotation_colors = ann_colors,
+    fontsize_row = 15,
+    )
+merged_genera_pheatmap_plt
+
+
+col_annotation %>%
+  tail()
+
+colnames(merged_genera) %>%
+  tail()
+
+ggsave("figs/export_for_assembly/R/figureS1C_genera_heatmap.pdf", merged_genera_pheatmap_plt, width=20, height=10, units="cm")
+ggsave("figs/export_for_assembly/R/figureS1C_genera_heatmap.svg", merged_genera_pheatmap_plt, width=20, height=10, units="cm")
+```
+
+# Supplement 1D - shannon diversity of genera in Actinobacteria
+```{r}
+raw_agg_phyla <- extract_data(raw_agg, "Bacteria", "phylum", info_cols) %>% get_top_by_rowMeans(5)
+phyla_list <- raw_agg_phyla %>% pull(name)
+
+
+# Iterate through each phylum. For each phylum, filter the tibble to get just those rows containing
+# the phylum in the taxonomy. Then, find bacterial genera and calculate shannon diversity.
+genus_shannon_by_phylum <- tibble(phylum = "", sample="", alpha_diversity = "")
+for (phylum in phyla_list) {
+  
+  # First find genera that are in that phylum
+  phyla_filtered <- raw_agg %>% filter(grepl(phylum, taxonomy))
+  phyla_filtered <- phyla_filtered %>% extract_data("Bacteria", "genus", info_cols)
+  alpha_div <- as.numeric(apply(phyla_filtered[2:length(phyla_filtered)], 2, diversity))
+
+  output <- tibble(phylum = phylum,
+                   sample= colnames(phyla_filtered)[2:length(phyla_filtered)],
+                   alpha_diversity = alpha_div)
+  
+  genus_shannon_by_phylum <-
+    rbind(genus_shannon_by_phylum,
+          output
+          )
+}
+
+
+
+genus_shannon_by_phylum <- genus_shannon_by_phylum %>%
+  filter(sample != "")
+
+# Label cohort
+genus_shannon_by_phylum <- genus_shannon_by_phylum %>%
+  mutate(cohort = hash_lookup(cohort_hashmap_TCGAMERGED, sample)) %>%
+  filter(phylum != "") %>% #removes first empty row
+  mutate(alpha_diversity = as.numeric(alpha_diversity)) %>%
+  mutate(order=match(cohort, cohort_order)) %>%
+  mutate(Sample_type = ifelse(grepl("RNA", cohort), "ESCC RNA", "ESCC DNA")) %>%
+  mutate(Sample_type = ifelse(grepl("COAD", cohort), "COAD DNA", Sample_type))
+
+actinobacteria_genus_alpha_div_plt <- genus_shannon_by_phylum %>% filter(phylum=="Actinobacteria") %>%
+  ggplot() +
+  geom_boxplot(
+    aes(x=reorder(cohort, order), y=alpha_diversity, fill=Sample_type),
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    aes(x=reorder(cohort, order), y=alpha_diversity)
+  ) +
+  theme_classic(base_size=15) +
+  coord_flip() +
+  scale_fill_manual(values=c("#C5283D", "#fca311", "#a8dadc")) +
+  ylab("Genus Shannon Diversity") +
+  xlab("Cohort") + ggtitle("Shannon Diversity Within\nThe Phylum Actinobacteria") +
+  guides(fill = guide_legend(reverse=T), title="Sample Type")
+actinobacteria_genus_alpha_div_plt
+
+
+ggsave("figs/export_for_assembly/R/figureS1D_actinobacteria_genus_alpha_div_plt.pdf", actinobacteria_genus_alpha_div_plt, width=20, height=10, units="cm")
+ggsave("figs/export_for_assembly/R/figureS1D_actinobacteria_genus_alpha_div_plt.svg", actinobacteria_genus_alpha_div_plt, width=20, height=10, units="cm")
+```
+
+
+<!-- # Supplement 1E - shannon diversity of genera in Proteobacteria -->
+<!-- ```{r} -->
+<!-- proteobacteria_genus_alpha_div_plt <- genus_shannon_by_phylum %>% filter(phylum=="Proteobacteria") %>% -->
+<!--   ggplot() + -->
+<!--   geom_boxplot( -->
+<!--     aes(x=reorder(cohort, order), y=alpha_diversity, fill=Sample_type), -->
+<!--     outlier.shape = NA -->
+<!--   ) + -->
+<!--   geom_jitter( -->
+<!--     aes(x=reorder(cohort, order), y=alpha_diversity) -->
+<!--   ) + -->
+<!--   theme_classic(base_size=15) + -->
+<!--   coord_flip() + -->
+<!--   scale_fill_manual(values=c("#C5283D", "#fca311", "#a8dadc")) + -->
+<!--   ylab("Genus Shannon Diversity") + -->
+<!--   xlab("Cohort") + ggtitle("Shannon Diversity Within\nThe Phylum Proteobacteria") + -->
+<!--   guides(fill = guide_legend(reverse=T), title="Sample Type") -->
+<!-- proteobacteria_genus_alpha_div_plt -->
+
+
+<!-- ggsave("figs/export_for_assembly/R/figureS1E_proteobacteria_genus_alpha_div_plt.pdf", proteobacteria_genus_alpha_div_plt, width=20, height=10, units="cm") -->
+<!-- ggsave("figs/export_for_assembly/R/figureS1E_proteobacteria_genus_alpha_div_plt.svg", proteobacteria_genus_alpha_div_plt, width=20, height=10, units="cm") -->
+<!-- ``` -->
+
+
+
+# Assemble - Supplementary figure 1
+```{r}
+
+# CANT ASSEMBLE - the ggplot-converted pheatmaps don't play well with patchwork.
+
+```
+
+
+
+
+
+
+
+
+
+
+
+#############################
+# MISC / reserved
+############################
+
+
+
+# MISC - getting counts of cohorts
+```{r}
+
+cohort_key %>%
+  count(cohort)
+
+
+wgs_saliva %>%
+  select(-info_cols) %>%
+  ncol() #45 samples
+```
