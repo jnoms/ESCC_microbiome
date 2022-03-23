@@ -1,0 +1,248 @@
+---
+title: "Tz ESCC Microbiome"
+author: "Jason Nomburg"
+output: html_notebook
+---
+
+# Load libraries and source in functions
+```{r}
+library(tidyverse)
+library(reshape2)
+library(hash) # repacelment for hashmap...
+library(patchwork)
+library(magrittr)
+
+
+
+# Plotting 
+library(scales) #allows use of "comma" to replace i.e. 1e6 with 1,000,000 during plotting
+
+
+# My functions
+source("functions.R")
+
+
+
+
+
+library(decontam)
+
+
+
+```
+
+
+# Constants
+```{r}
+info_cols <- c("tax_id","taxonomy","type","kingdom","reference_length","mean","median","max")
+cohort_order <- c("TCGA COAD", "TCGA ESCC", "Golestan, Iran", "Shanxi, China", "ESCCAPE Kenya", "ESCCAPE Tanzania", "MUHAS Tanzania", "MUHAS Tanzania (RNA)", "UNC Project - Malawi (RNA)")
+```
+
+#------------------------------------------------------#
+# IMPORT DATA
+#------------------------------------------------------#
+
+# Constants
+```{r}
+info_cols <- c("tax_id","taxonomy","type","kingdom","reference_length","mean","median","max")
+cohort_order <- c("TCGA COAD", "TCGA ESCC", "Golestan, Iran", "Shanxi, China", "ESCCAPE Kenya", "ESCCAPE Tanzania", "MUHAS Tanzania", "MUHAS Tanzania (RNA)", "UNC Project - Malawi (RNA)")
+```
+
+
+
+# Import mutographs
+```{r}
+mutographs <- read_delim("data/mutographs/mutographs1_5.score.txt", delim="\t")
+mutographs_key <- read_delim("data/mutographs/mutographs_key.txt", delim="\t")
+
+# Remove the obsolete blood samples
+blood_samples <- colnames(mutographs)[grep("blood", colnames(mutographs))]
+mutographs <- mutographs %>%
+  select(-blood_samples)
+
+# Format the column names
+colnames(mutographs) <- basename(colnames(mutographs)) %>%
+  str_replace_all("_tumor", "") %>%
+  str_replace_all(".pathseq.txt", "")
+
+# Patients 42 and 43 are split, so need to re-label the second samples and then consolidate them
+#--------------------------------------------------------------------------------------------------#
+colnames(mutographs)[colnames(mutographs) == "42"][2] <- "42.1"
+colnames(mutographs)[colnames(mutographs) == "43"][2] <- "43.1"
+
+
+# Make character for better handling
+colnames(mutographs) <- as.character(colnames(mutographs))
+
+
+vals_42 <- mutographs %>%
+  pull("42")
+vals_42.1 <- mutographs %>%
+  pull("42.1")
+vals_42_agg <- vals_42 + vals_42.1
+mutographs$`42` <- vals_42_agg
+mutographs$`42.1` <- NULL
+
+vals_43 <- mutographs %>%
+  pull("43")
+vals_43.1 <- mutographs %>%
+  pull("43.1")
+vals_43_agg <- vals_43 + vals_43.1
+mutographs$`43` <- vals_43_agg
+mutographs$`43.1` <- NULL
+
+# Turn sample numbers back to numeric...
+colnames(mutographs)[7:ncol(mutographs)] <- as.numeric(colnames(mutographs)[7:ncol(mutographs)])
+#--------------------------------------------------------------------------------------------------#
+
+
+# Make a hashmap to convert case_identifier to country
+mutographs_hashmap <- hash(as.factor(mutographs_key$case_identifier), mutographs_key$country)
+  
+
+
+# Make copies of mutographs that are split by cohort - Tz, Kenya, China, Iran
+muto_tz_list <- colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "Tanzania"]
+muto_china_list <- colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "China"]
+muto_kenya_list <-  colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "Kenya"]
+muto_iran_list <-  colnames(mutographs)[7:length(mutographs)][hash_lookup(mutographs_hashmap, colnames(mutographs)[7:length(mutographs)]) == "Iran"]
+
+mutographs_tz <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_tz_list)
+mutographs_china <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_china_list)
+mutographs_kenya <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_kenya_list)
+mutographs_iran <- mutographs %>%
+  select(colnames(mutographs)[1:6], muto_iran_list)
+```
+
+# Import Mutographs metrics
+```{r}
+mutographs_metrics <- read_delim("data/mutographs/mutographs1_5.metrics.txt", delim="\t")
+
+# Remove the obsolete blood samples
+blood_samples <- colnames(mutographs_metrics)[grep("blood", colnames(mutographs_metrics))]
+mutographs_metrics <- mutographs_metrics %>%
+  select(-blood_samples)
+
+# Format the column names
+colnames(mutographs_metrics) <- basename(colnames(mutographs_metrics)) %>%
+  str_replace_all("_tumor", "") %>%
+  str_replace_all(".filter_metrics.txt", "")
+
+
+
+# Patients 42 and 43 are split, so need to re-label the second samples and then consolidate them
+#--------------------------------------------------------------------------------------------------#
+colnames(mutographs_metrics)[colnames(mutographs_metrics) == "42"][2] <- "42.1"
+colnames(mutographs_metrics)[colnames(mutographs_metrics) == "43"][2] <- "43.1"
+
+vals_42 <- mutographs_metrics %>%
+  pull("42")
+vals_42.1 <- mutographs_metrics %>%
+  pull("42.1")
+vals_42_agg <- vals_42 + vals_42.1
+mutographs_metrics$`42` <- vals_42_agg
+mutographs_metrics$`42.1` <- NULL
+
+vals_43 <- mutographs_metrics %>%
+  pull("43")
+vals_43.1 <- mutographs_metrics %>%
+  pull("43.1")
+vals_43_agg <- vals_43 + vals_43.1
+mutographs_metrics$`43` <- vals_43_agg
+mutographs_metrics$`43.1` <- NULL
+#--------------------------------------------------------------------------------------------------#
+
+# Format them
+mutographs_metrics <- format_metrics(mutographs_metrics)
+
+
+
+# Import the counts of the human-mapped reads that were not processed through PathSeq
+mutographs_hu_read_counts <- read_delim("data/mutographs/mutographs_human_mapped_counts.txt", delim="\t")
+mutographs_hu_read_counts$name <- as.character(mutographs_hu_read_counts$name)
+mutographs_hu_read_counts$count <- as.numeric(mutographs_hu_read_counts$count)
+mutographs_hu_read_counts_hashmap <- hash(mutographs_hu_read_counts$name, mutographs_hu_read_counts$count)
+
+# Add counts to the pathseq metrics file
+mutographs_metrics <- mutographs_metrics %>%
+  mutate(HOST_READS_FILTERED = as.numeric(HOST_READS_FILTERED) + hash_lookup(mutographs_hu_read_counts_hashmap,name))
+
+mutographs_hu_hashmap <- hash(mutographs_metrics$name, make_factor_numeric(mutographs_metrics$HOST_READS_FILTERED))
+
+```
+
+
+
+
+# Import Mutographs concentrations
+```{r}
+mutographs_concentrations <- read_delim("data/mutographs/mutographs_concentrations.txt", delim="\t") %>%
+  select(case_identifier, conc = `Conc (nM)`)
+```
+
+
+#------------------------------------------------------#
+# Running Decontam
+#------------------------------------------------------#
+```{r}
+# Get bacterial genera, and then turn into relative abundance                           
+mutographs_genera <- extract_data(mutographs, 'Bacteria', 'genus', info_cols)
+
+# make relative abundance... my relative_abundance() function is messing up for some reason... 
+mutographs_genera <- lapply(mutographs_genera[, 2:208], function(x) x/sum(x)) %>%
+  as_tibble() %>%
+  add_column(name = mutographs_genera$name) %>%
+    dplyr::select(name, everything())
+
+
+
+
+
+# Format
+mutographs_genera <- as.data.frame(mutographs_genera) 
+rownames(mutographs_genera) <- make.unique(mutographs_genera$name) #there are two Ilebacterium generas, this makes one of them Ilebacterium.1
+mutographs_genera$name <- NULL
+
+# Filter the genera with no counts in any sample
+table(rowSums(mutographs_genera) == 0)
+mutographs_genera <- mutographs_genera[rowSums(mutographs_genera) != 0,]
+
+
+# Need to make sure the genera tibble and the concentration tibble is in the same order
+#-----------------------------#
+
+# First, only keep those in each that are present in both. Then, arrange in the same order
+in_both <- colnames(mutographs_genera)[colnames(mutographs_genera) %in% mutographs_concentrations$case_identifier]
+
+
+mutographs_genera <- mutographs_genera %>%
+  select(in_both)
+mutographs_concentrations <- mutographs_concentrations %>%
+  filter(case_identifier %in% in_both)
+
+mutographs_concentrations <- mutographs_concentrations %>% arrange(factor(case_identifier, levels = in_both))
+
+# Validate it
+print(mutographs_concentrations$case_identifier)
+print(colnames(mutographs_genera)[1:ncol(mutographs_genera)])
+
+
+# Run decontam
+#-----------------------------#
+
+result <- isContaminant(as.matrix(t(mutographs_genera)), conc=mutographs_concentrations$conc, method="frequency", threshold = 0.2)
+
+
+result %>%
+  arrange(p)
+
+
+
+# Save the output file
+#-----------------------------#
+write_delim(result %>% mutate(name = rownames(result)) %>% select(name, everything()), "data/mutographs/mutographs_decontam.tsv", delim="\t")
+
+```
